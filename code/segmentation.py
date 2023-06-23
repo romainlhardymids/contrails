@@ -1,36 +1,25 @@
 import sys
-sys.path.append("../../latent-diffusion")
-sys.path.append("../../taming-transformers")
-sys.path.append("../../mids-capstone-2023/code")
+sys.path.append("../code")
 
-import albumentations as A
 import argparse
-import copy
-import cv2
 import gc
 import logging
-import numpy as np
 import os
-import pandas as pd
-import scipy.io
 import segmentation_models_pytorch as smp
 import time
-import timm
 import torch
 import torch.nn as nn
-import torchvision.models as models
 import utils
 import warnings
 import yaml
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from albumentations.pytorch import ToTensorV2
-from datasets import SegmentationDataset, prepare_segmentation_data
+from dataset import ContrailsDataset, get_transform
 from diffusers.optimization import get_scheduler
-from torch.utils.data import DataLoader, WeightedRandomSampler
-
+from torch.utils.data import DataLoader
+from utils import load_metadata
 
 logger = get_logger(__name__, log_level="INFO")
 warnings.filterwarnings("ignore") 
@@ -39,49 +28,15 @@ warnings.filterwarnings("ignore")
 def create_segmentation_model(config):
     return smp.UnetPlusPlus(
         encoder_name=config.backbone, 
-        encoder_weights="imagenet",
+        encoder_weights=config.encoder_weights,
+        encoder_depth=5,
         in_channels=3,
-        encoder_depth=config.num_encoding_blocks,
-        decoder_channels=config.decoder_channels,
-        decoder_attention_type="scse",
-        classes=4
+        classes=1
     )
 
 
-def get_train_transform():
-    return A.Compose([
-        A.GaussianBlur((3, 7), p=0.25),
-        A.HorizontalFlip(p=0.5),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], max_pixel_value=1.0, always_apply=True),
-        ToTensorV2(always_apply=True)
-    ])
-
-
-def get_valid_transform():
-    return A.Compose([
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], max_pixel_value=1.0, always_apply=True),
-        ToTensorV2(always_apply=True)
-    ])
-    
-
-def prepare_dataloaders(train_dataset, valid_dataset, batch_size, num_workers=2):
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers
-    )
-    valid_loader = DataLoader(
-        valid_dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        num_workers=num_workers
-    )
-    return train_loader, valid_loader
-
-
-def get_dice_score(output, target, epsilon=1e-9):
-    p0 = output
+def get_dice_score(prob, target, epsilon=1e-9):
+    p0 = prob
     g0 = target
     p1 = 1. - p0
     g1 = 1. - g0
@@ -94,68 +49,78 @@ def get_dice_score(output, target, epsilon=1e-9):
     return dice_score
 
 
-def get_dice_loss(output, target):
-    return 1. - get_dice_score(output, target)
+def get_dice_loss(prob, target):
+    return 1. - get_dice_score(prob, target)
 
 
-def valid_step(accelerator, model, batch, criterion):
+def valid_step(model, batch):
     with torch.no_grad():
         x = batch["image"]
-        y = batch["mask"].type(torch.LongTensor).to(accelerator.device)
+        y = batch["mask"]
         logits = model(x)
-        prob = nn.functional.softmax(logits, dim=1)
-        targets = torch.permute(nn.functional.one_hot(y, num_classes=4), (0, 3, 1, 2))
-        loss = criterion(prob, targets).mean()
+        prob = torch.sigmoid(logits)
+        pred = (prob > 0.5).float()
+        dice_loss = get_dice_loss(prob, y).mean()
+        bce_loss = nn.BCEWithLogitsLoss()(logits, y.float())
+        loss = 0.5 * dice_loss + 0.5 * bce_loss
         n = prob.size(0)
-        loss = loss * n
+        tp = (pred * y).sum()
     return {
-        "loss": loss,
-        "n": n
+        "loss": loss * n,
+        "bce_loss": bce_loss * n,
+        "dice_loss": dice_loss * n,
+        "n": n,
+        "true_positives": tp,
+        "cardinality": pred.sum() + y.sum()
     }
 
 
-def valid_epoch(accelerator, model, loader, criterion):
+def valid_epoch(model, loader):
     model.eval()
-    total_loss = 0.
+    loss = 0.
+    bce_loss = 0.
+    dice_loss = 0.
     n = 0
+    tp = 0.
+    cardinality = 0.
     for batch in loader:
-        outputs = valid_step(accelerator, model, batch, criterion)
-        total_loss += outputs["loss"]
+        outputs = valid_step(model, batch)
+        loss += outputs["loss"]
+        bce_loss += outputs["bce_loss"]
+        dice_loss += outputs["dice_loss"]
         n += outputs["n"]
+        tp += outputs["true_positives"]
+        cardinality += outputs["cardinality"]
     return {
-        "loss": total_loss / n
+        "loss": loss / n,
+        "bce_loss": bce_loss / n,
+        "dice_loss": dice_loss / n,
+        "global_dice_coef": 2. * tp / cardinality
     }
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Steatosis classification training script.")
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config_path",
         type=str,
         default="config.yaml",
-        required=True,
-        help="A path to a YAML config file to load arguments from.",
-    )  
-    parser.add_argument(
-        "--local_rank", 
-        type=int, 
-        default=-1, 
-        help="For distributed training: local_rank"
+        required=True
     )
-
     args = parser.parse_args()
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
-
     return args
 
 
-def train_segmentation_model(config):
+def train_segmentation_model(config_dict):
+    config = utils.dotdict(config_dict)
+
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         mixed_precision=config.mixed_precision,
-        log_with="wandb"
+        kwargs_handlers=[ddp_kwargs],
+        log_with="wandb",
     )
 
     logging.basicConfig(
@@ -168,31 +133,8 @@ def train_segmentation_model(config):
     if config.seed is not None:
         set_seed(config.seed)
 
-    if config.prepare_segmentation_data:
-        prepare_segmentation_data(config.raw_data_path, config.mask_dir, config.data_dir)
-
-    df_labels = pd.read_csv(config.label_path)
-    df_labels = df_labels.rename(columns={"patient_id": "patient"})
-    df_labels["patient"] = df_labels["patient"] - 1 # Fix zero-indexing error
-
-    df_raw = pd.read_csv(config.metadata_path)
-    df = df_raw.merge(df_labels, on=["patient"], how="inner")
-    df = df[df.dataset == "steatosis"]
-
-    df_train = df.copy()
-    df_valid = df.sample(n=100, replace=True)
-    df_test  = df.sample(n=100, replace=True)
-
-    # df_train = df[df.group == "train"].reset_index(drop=True)
-    # df_valid = df[df.group == "val"].reset_index(drop=True)
-    # df_test  = df[df.group == "test"].reset_index(drop=True)
-
-    logging.info(f"Training images: {len(df_train)}")
-    logging.info(f"Validation images: {len(df_valid)}")
-    logging.info(f"Test images: {len(df_test)}")
-    
-    train_transform = get_train_transform()
-    valid_transform = get_valid_transform()
+    train_meta = load_metadata("train")
+    valid_meta = load_metadata("validation")
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -217,12 +159,9 @@ def train_segmentation_model(config):
         eps=config.adam_epsilon,
     )
 
-    # Criterion
-    criterion = get_dice_loss
-
     # Datasets and data loaders
-    train_dataset = SegmentationDataset(df_train, train_transform)
-    valid_dataset = SegmentationDataset(df_valid, valid_transform)
+    train_dataset = ContrailsDataset(train_meta, split="train")
+    valid_dataset = ContrailsDataset(valid_meta, split="validation")
 
     train_dataloader = DataLoader(
         train_dataset, 
@@ -262,23 +201,24 @@ def train_segmentation_model(config):
         accelerator.init_trackers(
             config.wandb_project_name, 
             init_kwargs={"wandb":{"name":config.wandb_run_name}}, 
-            config=vars(config)
+            config=config_dict
         )
 
     global_step = 0
-    best_valid_loss = float("inf")
     while True:
         model.train()
         train_loss = 0.0
         for train_batch in train_dataloader:
             with accelerator.accumulate(model):
                 x = train_batch["image"]
-                y = train_batch["mask"].type(torch.LongTensor).to(accelerator.device)
+                y = train_batch["mask"]
 
                 logits = model(x)
-                prob = nn.functional.softmax(logits, dim=1)
-                targets = torch.permute(nn.functional.one_hot(y, num_classes=4), (0, 3, 1, 2))
-                loss = criterion(prob, targets).mean()
+                prob = torch.sigmoid(logits)
+                dice_loss = get_dice_loss(prob, y).mean()
+                bce_loss = nn.BCEWithLogitsLoss()(logits, y.float())
+                loss = 0.5 * dice_loss + 0.5 * bce_loss
+                loss = bce_loss
 
                 avg_loss = accelerator.gather(loss.repeat(config.train_batch_size)).mean()
                 train_loss += avg_loss.item() / config.gradient_accumulation_steps
@@ -300,17 +240,20 @@ def train_segmentation_model(config):
                 }, step=global_step)
                 train_loss = 0.0
 
-                if global_step in config.checkpointing_steps:
+                if global_step > 0 and global_step % config.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         save_path = os.path.join(config.checkpoint_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved accelerator state to {save_path}")
 
             if global_step % config.valid_delta_steps == 0:
-                outputs = valid_epoch(accelerator, model, valid_dataloader, criterion)
-                accelerator.log({"valid_loss": outputs["loss"]})
-                if outputs["loss"] < best_valid_loss:
-                    best_valid_loss = outputs["loss"]
+                outputs = valid_epoch(model, valid_dataloader)
+                accelerator.log({
+                    "valid_loss": outputs["loss"],
+                    "valid_bce_loss": outputs["bce_loss"],
+                    "valid_dice_loss": outputs["dice_loss"],
+                    "valid_global_dice_coef": outputs["global_dice_coef"]
+                })
                 model.train()
 
             if global_step >= config.max_train_steps * config.gradient_accumulation_steps:
@@ -324,26 +267,23 @@ def train_segmentation_model(config):
     return
 
 
-def get_wandb_run_name(
-    backbone,
-    seed
-):
-    return "::".join([
+def get_wandb_run_name(backbone):
+    return "__".join([
         f"backbone_{backbone}",
-        f"seed_{seed}"
+        f"timestamp_{round(time.time() * 1000)}"
     ])
 
 
 def main():
     args = parse_args()
     with open(args.config_path, "rb") as f:
-        config = utils.dotdict(yaml.load(f, Loader=yaml.FullLoader))
-    config_ = copy.deepcopy(config)
-    config_.wandb_run_name = get_wandb_run_name(config_.backbone, config_.seed)
-    config_.checkpoint_dir = os.path.join(config_.output_dir, f"{config_.backbone}")
-    train_segmentation_model(config_)
+        config_dict = yaml.load(f, Loader=yaml.FullLoader)
+    config_dict["wandb_run_name"] = get_wandb_run_name(config_dict["backbone"])
+    config_dict["checkpoint_dir"] = os.path.join(config_dict["output_dir"], config_dict["wandb_run_name"])
+    train_segmentation_model(config_dict)
     torch.cuda.empty_cache()
     gc.collect()
+
 
 if __name__ == "__main__":
     main()
