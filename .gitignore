@@ -1,5 +1,7 @@
 data
 models
+logs
+evaluation
 contrails.code-workspace
 __pycache__
 wandb

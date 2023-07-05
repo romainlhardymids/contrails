@@ -14,7 +14,7 @@ import wandb
 import warnings
 import yaml
 
-from dataset import ContrailsDataset
+from dataset import ContrailsPretrainingDataset
 from model import Unet
 from pytorch_lightning.callbacks import (
     EarlyStopping, 
@@ -26,7 +26,7 @@ from pytorch_lightning.loggers import WandbLogger
 from torchmetrics.functional import average_precision, dice
 from torch.utils.data import DataLoader
 from transformers import get_cosine_with_hard_restarts_schedule_with_warmup
-from utils import data_split, FOLDS
+from utils import data_split, load_synthetic_metadata, FOLDS
 
 warnings.filterwarnings("ignore") 
 
@@ -68,8 +68,6 @@ class SegmentationModule(pl.LightningModule):
         self.model = create_segmentation_model(config)
         # self.criterion = smp.losses.DiceLoss(mode="binary", smooth=config["label_smoothing"])
         self.criterion = smp.losses.SoftBCEWithLogitsLoss(pos_weight=torch.tensor([4.0]), smooth_factor=config["label_smoothing"])
-        self.logit_tracker = []
-        self.label_tracker = []
 
     def forward(self, batch):
         x = batch["image"]
@@ -112,18 +110,6 @@ class SegmentationModule(pl.LightningModule):
             logits = torch.nn.functional.interpolate(logits, size=256, mode="bilinear")
         loss = self.criterion(logits, y)
         self.log("valid_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
-        self.logit_tracker.append(logits)
-        self.label_tracker.append(y)
-
-    def on_validation_epoch_end(self):
-        logits = torch.cat(self.logit_tracker)
-        y = torch.cat(self.label_tracker)
-        valid_auprc = average_precision(logits, y.long(), task="binary")
-        valid_dice = dice(logits, y.long())
-        self.log("valid_dice", valid_dice, on_step=False, on_epoch=True)
-        self.log("valid_auprc", valid_auprc, on_step=False, on_epoch=True)
-        self.logit_tracker.clear()
-        self.label_tracker.clear()
 
 
 def parse_args():
@@ -145,10 +131,33 @@ def train_segmentation_model(fold, config):
 
     # Datasets and data loaders
     df = data_split("../data/data_split.csv")
-    df_train = df[(df.fold != fold) & (df.split != "validation")]
-    df_valid = df[df.fold == fold]
-    train_dataset = ContrailsDataset(df_train, timesteps=1, image_size=config["model"]["image_size"], split="train")
-    valid_dataset = ContrailsDataset(df_valid, timesteps=1, image_size=config["model"]["image_size"], split="validation")
+    df_real_train = df[(df.fold != fold) & (df.split != "validation")]
+    df_real_valid = df[df.fold == fold]
+
+    df_synthetic_train = None
+    df_synthetic_valid = None
+    num_synthetic = config["model"]["num_synthetic"]
+    if num_synthetic > 0:
+        df_synthetic_train = load_synthetic_metadata()
+        df_synthetic_train = df_synthetic_train[df_synthetic_train.fold == fold]
+        df_synthetic_train = df_synthetic_train.sample(n=num_synthetic, replace=False).reset_index(drop=True)
+
+    train_dataset = ContrailsPretrainingDataset(
+        df_real_train, 
+        df_synthetic_train,
+        config["pseudo_labels_dir"],
+        timesteps=8, 
+        image_size=config["model"]["image_size"], 
+        split="train"
+    )
+    valid_dataset = ContrailsPretrainingDataset(
+        df_real_valid, 
+        df_synthetic_valid,
+        config["pseudo_labels_dir"],
+        timesteps=8, 
+        image_size=config["model"]["image_size"], 
+        split="validation"
+    )
     
     logging.info(f"[FOLD {fold}]")
     logging.info(f"Training images: {len(train_dataset)}")
@@ -168,18 +177,18 @@ def train_segmentation_model(fold, config):
         num_workers=config["num_workers"]
     )
 
-    name = f"finetuning__backbone_{config['model']['encoder']}__fold_{fold}"
+    name = f"pretraining__backbone_{config['model']['encoder']}__fold_{fold}"
     checkpoint_callback = ModelCheckpoint(
         save_weights_only=True,
-        monitor="valid_dice",
+        monitor="valid_loss",
         dirpath=config["output_dir"],
-        mode="max",
+        mode="min",
         filename=name,
         save_top_k=1,
         verbose=1,
     )
 
-    early_stopping_callback = EarlyStopping(monitor="valid_auprc", **config["early_stopping"])
+    early_stopping_callback = EarlyStopping(monitor="valid_loss", **config["early_stopping"])
     accumulate_callback = GradientAccumulationScheduler(**config["accumulate"])
     swa_callback = StochasticWeightAveraging(**config["swa"])
 
@@ -190,9 +199,6 @@ def train_segmentation_model(fold, config):
     )
 
     model = SegmentationModule(config["model"])
-    if config["model"]["checkpoint"] is not None:
-        checkpoint = f"{config['model']['checkpoint']}__fold_{fold}.ckpt"
-        model.load_state_dict(torch.load(checkpoint)["state_dict"])
 
     trainer.fit(model, train_dataloader, valid_dataloader)
 
@@ -206,7 +212,7 @@ def main():
     args = parse_args()
     with open(args.config, "rb") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
-    for fold in range(FOLDS): # Change later
+    for fold in range(FOLDS):
         train_segmentation_model(fold, config)
         torch.cuda.empty_cache()
         gc.collect()
