@@ -1,0 +1,56 @@
+seed: 1
+train_batch_size: 16
+valid_batch_size: 32
+num_workers: 16
+output_dir: "/home/romainlhardy/kaggle/contrails/models/checkpoints"
+wandb_project: "contrails-classification"
+
+early_stopping:
+  mode: "max"
+  patience: 100
+  verbose: 1
+
+swa:
+  swa_lrs: 1.0e-2
+  swa_epoch_start: 0.8
+
+model:
+  scheduler:
+    num_warmup_steps: 2500
+    num_training_steps: 25000
+  optimizer:
+    lr: 5.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-5
+    eps: 1.0e-8
+  model:
+    encoder_name: "tf_efficientnetv2_s.in21k_ft_in1k"
+    representation_dim: 256
+    dropout: 0.2
+    backbone_params: 
+      pretrained: true
+      drop_path_rate: 0.2
+  losses:
+    bce:
+      pos_weight: 1.0
+    ntx:
+      temperature: 0.1
+  data:
+    timesteps: [4]
+    image_size: 512
+    use_pseudo_labels: false
+    cutmix:
+      cutmix_prob: 0.8
+      cutmix_num_holes: 2
+      cutmix_min_size: 16
+      cutmix_max_size: 64
+
+trainer:
+  min_steps: 25000
+  max_steps: 25000
+  max_epochs: 1000
+  enable_progress_bar: false
+  precision: "16-mixed"
+  accelerator: "gpu"
+  devices: 2
+  strategy: "ddp_find_unused_parameters_false"

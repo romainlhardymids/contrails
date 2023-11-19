@@ -1,0 +1,80 @@
+seed: 7
+train_batch_size: 8
+valid_batch_size: 32
+num_workers: 8
+output_dir: "../models/checkpoints"
+wandb_project: "contrails-final"
+
+early_stopping:
+  mode: "max"
+  patience: 100
+  verbose: 1
+
+accumulate:
+  scheduling: {0: 8}
+
+swa:
+  swa_lrs: 1.0e-2
+  swa_epoch_start: 0.8
+
+model:
+  scheduler:
+    num_warmup_steps: 500
+    num_training_steps: 5000
+  optimizer:
+    lr: 5.0e-3
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-5
+    eps: 1.0e-8
+  model:
+    family: "unet"
+    encoder_params:
+      class: EfficientNetEncoder2d
+      encoder_name: "tf_efficientnetv2_l.in21k_ft_in1k"
+      params:
+        out_channels: [3, 32, 64, 96, 224, 640]
+        stage_idx: [2, 3, 5]
+        backbone_params: 
+          pretrained: true
+          in_chans: 3
+          drop_path_rate: 0.2
+    decoder_params: 
+      decoder_channels: [256, 128, 64, 32, 16]
+      scale_factors: [2, 2, 2, 2, 2]
+      num_blocks: 5
+      block_depth: 1
+      separable: false
+      use_aspp: false
+      use_batchnorm: true 
+      attention_type: "scse"
+      activation: "silu"
+  losses:
+    bce:
+      pos_weight: 3.5
+  data:
+    timesteps: [4]
+    image_size: 512
+    use_pseudo_labels: false
+    cutmix:
+      cutmix_prob: 0.8
+      cutmix_num_holes: 2
+      cutmix_min_size: 16
+      cutmix_max_size: 64
+
+trainer:
+  min_steps: 5000
+  max_steps: 5000
+  max_epochs: 1000
+  enable_progress_bar: false
+  precision: "16-mixed"
+  accelerator: "gpu"
+  devices: 2
+  strategy: "ddp_find_unused_parameters_true"
+
+evaluation:
+  checkpoint: "../models/checkpoints/finetuning__family_2d__backbone_tf_efficientnetv2_l.in21k_ft_in1k"
+  output_dir: "../data/features/finetuning__family_2d__backbone_tf_efficientnetv2_l.in21k_ft_in1k"
+  resize: 256
+  device: "cuda"
+  bins: 100
+  use_validation_split: false

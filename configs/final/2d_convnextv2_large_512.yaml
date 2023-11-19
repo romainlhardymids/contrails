@@ -1,0 +1,69 @@
+seed: 25
+train_batch_size: 4
+valid_batch_size: 32
+num_workers: 16
+output_dir: "/home/romainlhardy/kaggle/contrails/models/checkpoints"
+wandb_project: "contrails-full"
+
+early_stopping:
+  mode: "max"
+  patience: 100
+  verbose: 1
+
+swa:
+  swa_lrs: 1.0e-2
+  swa_epoch_start: 0.8
+
+model:
+  scheduler:
+    num_warmup_steps: 5000
+    num_training_steps: 50000
+  optimizer:
+    lr: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-5
+    eps: 1.0e-8
+  model:
+    family: "unet"
+    encoder_params:
+      class: ConvNeXtEncoder2d
+      encoder_name: "convnextv2_large.fcmae_ft_in22k_in1k_384"
+      params:
+        out_channels: [3, 192, 192, 384, 768, 1536]
+        stage_idx: [1, 2, 3]
+        backbone_params: 
+          pretrained: true
+          in_chans: 3
+          drop_path_rate: 0.3
+    decoder_params: 
+      decoder_channels: [256, 128, 64, 32, 16]
+      scale_factors: [2, 2, 2, 1, 4]
+      num_blocks: 5
+      block_depth: 1
+      separable: false
+      use_aspp: false
+      use_batchnorm: true 
+      attention_type: "scse"
+      activation: "silu"
+  losses:
+    bce:
+      pos_weight: 3.5
+  data:
+    timesteps: [4]
+    image_size: 512
+    use_pseudo_labels: false
+    cutmix:
+      cutmix_prob: 0.8
+      cutmix_num_holes: 2
+      cutmix_min_size: 16
+      cutmix_max_size: 64
+
+trainer:
+  min_steps: 50000
+  max_steps: 50000
+  max_epochs: 1000
+  enable_progress_bar: false
+  precision: "16-mixed"
+  accelerator: "gpu"
+  devices: 2
+  strategy: "ddp_find_unused_parameters_true"
