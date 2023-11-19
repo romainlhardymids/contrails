@@ -14,28 +14,30 @@ import yaml
 
 from data.dataset import ContrailsDataset3d
 from data.utils import data_split, FOLDS
-from training3d import SegmentationModule3d
+from train import SegmentationModule3d
 from torchmetrics import AveragePrecision, Dice
 from torchmetrics.functional import dice
 from torch.utils.data import DataLoader
 
 
 def load_model(module, config, checkpoint_path):
+    """Loads a 3D segmentation model checkpoint."""
     model = module(config)
     model.load_state_dict(torch.load(checkpoint_path)["state_dict"])
     return model
 
 
 def parse_args():
+    """Parses command-line arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="../configs/config.yaml", required=True)
     args = parser.parse_args()
     return args
 
 
-def evaluate3d(config):
+def evaluate(config):
+    """Evaluates a set of models on held-out data."""
     df = data_split("../data/data_split.csv")
-    # df = data_split("../data/data_split_dedup.csv")
 
     device = config["evaluation"]["device"]
     bins = config["evaluation"]["bins"]
@@ -121,7 +123,7 @@ def main():
     args = parse_args()
     with open(args.config, "rb") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
-    evaluate3d(config)
+    evaluate(config)
     torch.cuda.empty_cache()
     gc.collect()
 

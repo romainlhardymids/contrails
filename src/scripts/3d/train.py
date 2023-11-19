@@ -11,7 +11,7 @@ import wandb
 import warnings
 import yaml
 
-from data.dataset import ContrailsDataset3d
+from data.dataset import ContrailsDataset
 from pytorch_lightning.callbacks import (
     EarlyStopping, 
     GradientAccumulationScheduler,
@@ -125,7 +125,7 @@ def train(fold, config):
     df = utils.data_split("../data/data_split.csv")
     df_train = df[(df.fold != fold) & (df.split != "validation")]
     df_valid = df[df.fold == fold]
-    train_dataset = ContrailsDataset3d(
+    train_dataset = ContrailsDataset(
         timesteps=config["model"]["data"]["timesteps"],
         df=df_train, 
         image_size=config["model"]["data"]["image_size"], 
@@ -135,7 +135,7 @@ def train(fold, config):
         cutmix_max_size=config["model"]["data"]["cutmix"]["max_size"],
         split="train"
     )
-    valid_dataset = ContrailsDataset3d(
+    valid_dataset = ContrailsDataset(
         timesteps=config["model"]["data"]["timesteps"],
         df=df_valid, 
         image_size=config["model"]["data"]["image_size"], 
