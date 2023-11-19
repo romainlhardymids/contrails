@@ -1,7 +1,5 @@
 build
+lib
 models
-logs
-evaluation
-contrails.egg-info
 __pycache__
-wandb
+contrails.egg-info
